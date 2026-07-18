@@ -1,0 +1,30 @@
+# Drop 50% of network packets to/from the payment pod.
+#
+# Observe: bursty, intermittent payment errors — a network-layer failure
+# signature distinct from redis-cart-partition's full partition and
+# product-catalog-latency's uniform delay; rounds out the network-fault
+# taxonomy (delay, partition, loss).
+#
+# No `duration` set deliberately: Chaos Mesh anchors duration to the object's
+# creation time, not to when it's resumed, so a short duration on an
+# experiment that ships paused would silently no-op (skip injection entirely)
+# once the demo has been up longer than that duration. Runs until the
+# demo-giver clicks Pause.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: payment-packet-loss
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    experiment.chaos-mesh.org/pause: "true"
+spec:
+  action: loss
+  mode: all
+  selector:
+    namespaces:
+      - o11y-metrics
+    labelSelectors:
+      opentelemetry.io/name: payment
+  loss:
+    loss: "50"
+    correlation: "25"

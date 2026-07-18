@@ -1,0 +1,30 @@
+# Inject disk I/O errors on the frontend pod.
+#
+# Observe: 99% of file operations under /home fail with errno 5 (EIO) —
+# a disk-fault signature distinct from the network/CPU/memory faults above,
+# useful for demonstrating infrastructure-layer I/O diagnosis in Kibana.
+#
+# No `duration` set deliberately: Chaos Mesh anchors duration to the object's
+# creation time, not to when it's resumed, so a short duration on an
+# experiment that ships paused would silently no-op (skip injection entirely)
+# once the demo has been up longer than that duration. Runs until the
+# demo-giver clicks Pause.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IOChaos
+metadata:
+  name: frontend-io-error
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    experiment.chaos-mesh.org/pause: "true"
+spec:
+  action: fault
+  mode: one
+  selector:
+    namespaces:
+      - o11y-metrics
+    labelSelectors:
+      opentelemetry.io/name: frontend
+  volumePath: /home
+  path: /home/**/*
+  errno: 5
+  percent: 99

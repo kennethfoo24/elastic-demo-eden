@@ -1,0 +1,29 @@
+# Inject network latency on the product catalog service.
+#
+# Observe: p95/p99 latency spike on product-catalog spans that propagates up
+# to frontend page-load latency; SLO burn on catalog-dependent requests.
+#
+# No `duration` set deliberately: Chaos Mesh anchors duration to the object's
+# creation time, not to when it's resumed, so a short duration on an
+# experiment that ships paused would silently no-op (skip injection entirely)
+# once the demo has been up longer than that duration. Runs until the
+# demo-giver clicks Pause.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: product-catalog-latency
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    experiment.chaos-mesh.org/pause: "true"
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - o11y-metrics
+    labelSelectors:
+      opentelemetry.io/name: product-catalog
+  delay:
+    latency: "500ms"
+    jitter: "100ms"
+    correlation: "50"

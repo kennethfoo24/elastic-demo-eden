@@ -1,0 +1,30 @@
+# Saturate CPU on the recommendation service.
+#
+# Observe: CPU saturation metric on recommendation pods, slower
+# recommendation spans, possible throttling. Contrast against the OTel
+# demo's own recommendationServiceCacheFailure feature flag (a memory leak)
+# to show CPU vs. memory pressure signatures side by side.
+#
+# No `duration` set deliberately: Chaos Mesh anchors duration to the object's
+# creation time, not to when it's resumed, so a short duration on an
+# experiment that ships paused would silently no-op (skip injection entirely)
+# once the demo has been up longer than that duration. Runs until the
+# demo-giver clicks Pause.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: recommendation-cpu-stress
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    experiment.chaos-mesh.org/pause: "true"
+spec:
+  mode: all
+  selector:
+    namespaces:
+      - o11y-metrics
+    labelSelectors:
+      opentelemetry.io/name: recommendation
+  stressors:
+    cpu:
+      workers: 2
+      load: 90

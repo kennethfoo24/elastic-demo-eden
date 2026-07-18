@@ -1,0 +1,20 @@
+# Overrides for deploying to Kenneth's GKE cluster.
+# Layered on top of elastic-otel-demo-values.yaml.
+# Target chart: open-telemetry/opentelemetry-demo 0.38.6
+#
+# Fixes:
+#   - Raises product-catalog memory limit (chart default 20Mi is too low for the Elastic image)
+#   - Fixes OTEL_CONFIG_FILE path (chart mounts as .yml but env var says .yaml)
+
+components:
+  product-catalog:
+    resources:
+      limits:
+        memory: 200Mi
+      requests:
+        memory: 64Mi
+    envOverrides:
+      - name: GOMEMLIMIT
+        value: "150MiB"
+      - name: OTEL_CONFIG_FILE
+        value: "/otel-config.yml"  # chart mounts as .yml but default env says .yaml

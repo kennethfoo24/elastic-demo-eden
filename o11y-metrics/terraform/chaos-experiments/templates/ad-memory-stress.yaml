@@ -1,0 +1,28 @@
+# Drive memory pressure on a single ad-service pod.
+#
+# Observe: rising container memory on the ad pod, a possible OOMKilled +
+# restart, ad calls timing out/failing on the storefront while it happens.
+#
+# No `duration` set deliberately: Chaos Mesh anchors duration to the object's
+# creation time, not to when it's resumed, so a short duration on an
+# experiment that ships paused would silently no-op (skip injection entirely)
+# once the demo has been up longer than that duration. Runs until the
+# demo-giver clicks Pause.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: ad-memory-stress
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    experiment.chaos-mesh.org/pause: "true"
+spec:
+  mode: one
+  selector:
+    namespaces:
+      - o11y-metrics
+    labelSelectors:
+      opentelemetry.io/name: ad
+  stressors:
+    memory:
+      workers: 1
+      size: "512MB"

@@ -1,0 +1,19 @@
+# Kill a single frontend pod and let the Deployment reschedule it.
+#
+# Observe: a RESTARTS bump on the frontend pod, a brief availability gap /
+# 5xx blip at the storefront, then recovery as Kubernetes self-heals.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: frontend-pod-kill
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    experiment.chaos-mesh.org/pause: "true"
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - o11y-metrics
+    labelSelectors:
+      opentelemetry.io/name: frontend

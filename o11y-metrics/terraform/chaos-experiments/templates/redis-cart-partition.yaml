@@ -1,0 +1,37 @@
+# Isolate the cart cache (valkey-cart) from the cart service. Mirrors the
+# published Coroot example against the OTel demo:
+# https://coroot.com/blog/product-updates/battletesting-coroot-with-opentelemetry-demo-and-chaos-mesh/
+#
+# Observe: cart service errors talking to its cache, "add to cart" failures
+# on the storefront, error-rate spike on cart-dependent traces/spans.
+#
+# No `duration` set deliberately: Chaos Mesh anchors duration to the object's
+# creation time, not to when it's resumed, so a short duration on an
+# experiment that ships paused would silently no-op (skip injection entirely)
+# once the demo has been up longer than that duration. Runs until the
+# demo-giver clicks Pause.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: redis-cart-partition
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    # Ships paused: appears in the Chaos Dashboard idle. Click Resume to fire,
+    # Pause to stop. See https://chaos-mesh.org/docs/pause-experiment/
+    experiment.chaos-mesh.org/pause: "true"
+spec:
+  action: partition
+  mode: all
+  direction: to
+  selector:
+    namespaces:
+      - o11y-metrics
+    labelSelectors:
+      opentelemetry.io/name: valkey-cart
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - o11y-metrics
+      labelSelectors:
+        opentelemetry.io/name: cart
