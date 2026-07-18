@@ -24,8 +24,12 @@ yarn start "$@" || RC=$?
 # alerts still carrying pre-2024 timestamps to now, and tag them XDR so the
 # daily update-alerts-timestamp workflow keeps rolling them forward.
 if [[ "${1:-}" == "generate-alerts" ]]; then
+  ES_URL="$(echo -n "${ES_URL}" | tr -d '[:space:]')"
+  sleep 10  # let the freshly bulk-written alerts become searchable
+  curl -s -X POST "${ES_URL}/.alerts-security.alerts-default/_refresh" \
+    -H "Authorization: ApiKey ${ES_API_KEY}" > /dev/null || true
   NOW=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
-  curl -s -X POST "${ES_URL}/.alerts-security.alerts-default/_update_by_query?conflicts=proceed&refresh=true" \
+  RESP=$(curl -s -X POST "${ES_URL}/.alerts-security.alerts-default/_update_by_query?conflicts=proceed&refresh=true" \
     -H "Authorization: ApiKey ${ES_API_KEY}" \
     -H "Content-Type: application/json" \
     -d "{
@@ -35,7 +39,7 @@ if [[ "${1:-}" == "generate-alerts" ]]; then
         \"params\": {\"t\": \"${NOW}\"}
       },
       \"query\": {\"range\": {\"kibana.alert.last_detected\": {\"lt\": \"2024-01-01\"}}}
-    }" | head -c 300
-  echo ""
+    }" || true)
+  echo "timestamp-fix: ${RESP:0:200}"
 fi
 exit $RC
