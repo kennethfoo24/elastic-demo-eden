@@ -1,0 +1,11 @@
+apiVersion: v2
+name: chaos-experiments
+description: >-
+  Curated Chaos Mesh experiments targeting the OTel demo (otel-demo namespace).
+  Every experiment ships paused (experiment.chaos-mesh.org/pause: "true") so it
+  appears in the Chaos Dashboard idle — the demo-giver clicks Resume to fire it
+  and Pause to stop it. Installed by terraform/main.tf's helm_release
+  "chaos_experiments", which depends on helm_release "chaos_mesh" so the CRDs
+  these manifests reference already exist by the time this chart templates.
+type: application
+version: 0.1.0
