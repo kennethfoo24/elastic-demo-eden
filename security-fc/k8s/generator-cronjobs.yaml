@@ -1,0 +1,68 @@
+# Continuous demo data for the Security serverless project.
+# Requires secret `security-fc-es-creds` in namespace `security-fc` with keys:
+#   ES_URL, KIBANA_URL, ES_API_KEY
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: generate-alerts
+  namespace: security-fc
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 900
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: generator
+            image: kennethfoo24/security-documents-generator:latest
+            imagePullPolicy: Always
+            args: ["generate-alerts", "-n", "25", "-h", "10", "-u", "10"]
+            envFrom:
+            - secretRef:
+                name: security-fc-es-creds
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "256Mi"
+              limits:
+                cpu: "500m"
+                memory: "512Mi"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: generate-events
+  namespace: security-fc
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 900
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: generator
+            image: kennethfoo24/security-documents-generator:latest
+            imagePullPolicy: Always
+            args: ["generate-events", "500"]
+            envFrom:
+            - secretRef:
+                name: security-fc-es-creds
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "256Mi"
+              limits:
+                cpu: "500m"
+                memory: "512Mi"

@@ -1,0 +1,33 @@
+name: Build security-documents-generator
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/security-documents-generator/**'
+      - '.github/workflows/build-security-generator.yml'
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: Build security-documents-generator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: docker/security-documents-generator
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/security-documents-generator:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/security-documents-generator:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
