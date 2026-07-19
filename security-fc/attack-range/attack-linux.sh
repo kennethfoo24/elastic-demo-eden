@@ -77,4 +77,4 @@ find / -perm -4000 -type f 2>/dev/null | head
 # ---- Internal reconnaissance (T1046 Network Service Discovery via Nmap) ----
 nmap -sT -T4 -p 22,80,443,3389 10.148.0.0/28 2>/dev/null | tail -15 || true
 
-echo "[*] ===== Linux attack chain complete — check Security → Alerts ====="
+echo "[*] ===== Linux attack chain complete - check Security > Alerts ====="

