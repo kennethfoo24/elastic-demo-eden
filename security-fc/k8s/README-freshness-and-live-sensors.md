@@ -51,6 +51,19 @@ scripts, and a broken agent shows `orphaned` in Fleet. Fix = a **lightweight
 re-enroll of the already-installed binary** (no 600MB re-download):
 `elastic-agent.exe enroll --url=<FLEET_URL> --enrollment-token=<token> --force` then
 restart the `Elastic Agent` service, delivered via `windows-startup-script-ps1` + reset.
+If the guest-agent keeps crashing, recreate the VM (clean install+enroll on first boot
+is the most reliable path) — the fresh agent joins `attack-range-windows` and comes up healthy.
+
+## E. Live network capture + Threat Intelligence Utilities
+- **network_traffic (Packetbeat)** package policy on `attack-range-linux`: live packet
+  capture (flow/dns/tls/http/...) from the Linux VM → real network telemetry incl. the
+  attack's C2 beacons, nmap sweeps, and DNS. Feeds the Network page + correlation.
+  Note: the legacy Overview "Network events" widget buckets by `event.dataset`, which
+  the modern network_traffic integration does not populate (it uses `data_stream.dataset`),
+  so that specific widget may read 0 — the data is fully present in Security → Network,
+  Discover, and detection rules.
+- **ti_util (Threat Intelligence Utilities)** installed (asset-only): indicator dedup
+  transform + expiration + TI dashboards, so the custom `logs-ti_*` feed is properly managed.
 
 ## Data-sourcing philosophy
 - EDR (Defend), live KSPM, Linux auditd, threat-intel, Windows event logs = **live sensors**.
