@@ -1,11 +1,12 @@
 # Feeds the Security serverless project with meaningful, Attack-Discovery-ready
 # alerts every 6h. Two parts, always emitted together:
-#   1. THE CHAIN — every curated alert on host xdr-siem-windows-2022-ds
-#      (Execution certutil/rundll32 malware -> Defense Evasion Defender tampering
-#      -> Persistence driver+path activity -> Priv-Esc PrintSpooler -> C2 Threat
-#      Intel IP match), re-timestamped into ONE tight window so Attack Discovery
-#      correlates it as a single campaign. Entity links (host/user/process) are
-#      preserved verbatim so the graph connects.
+#   1. THE CHAINS — for each host in CHAIN_HOSTS, every curated alert on that host
+#      is re-timestamped into its own tight, staggered window and tagged with a
+#      per-host campaign id, so Attack Discovery correlates each as a distinct
+#      multi-stage campaign. The lead host xdr-siem-windows-2022-ds runs the full
+#      kill chain (Execution certutil/rundll32 malware -> Defense Evasion Defender
+#      tampering -> Persistence driver+path activity -> Priv-Esc PrintSpooler ->
+#      C2 Threat Intel IP match). Entity links (host/user/process) preserved verbatim.
 #   2. RANDOM SAMPLE — N other curated detections spread over the day for volume.
 # Requires secret security-fc-es-creds (ES_URL, ES_API_KEY) in namespace security-fc.
 apiVersion: v1
@@ -22,7 +23,12 @@ data:
     KEY = os.environ["ES_API_KEY"].strip()
     N = int(os.environ.get("RECYCLE_COUNT", "30"))
     SPREAD_MIN = int(os.environ.get("SPREAD_MINUTES", "360"))
-    CHAIN_HOST = os.environ.get("CHAIN_HOST", "xdr-siem-windows-2022-ds")
+    # Comma-separated list; each host is replayed as its own clustered campaign.
+    # (CHAIN_HOST kept as a fallback for backward compat.)
+    CHAIN_HOSTS = [h.strip() for h in os.environ.get(
+        "CHAIN_HOSTS",
+        os.environ.get("CHAIN_HOST", "xdr-siem-windows-2022-ds")
+    ).split(",") if h.strip()]
     CHAIN_WINDOW_MIN = int(os.environ.get("CHAIN_WINDOW_MINUTES", "90"))
     SRC = "eden-alerts-security"
     DEST = ".alerts-security.alerts-default"
@@ -54,33 +60,44 @@ data:
         return nid, src
 
     now = datetime.now(timezone.utc)
+    day = now.strftime("%Y%m%d")
     lines = []
+    summaries = []
 
-    # ---- 1. THE CHAIN: all alerts on CHAIN_HOST, clustered in one recent window ----
+    # ---- 1. THE CHAINS: each CHAIN_HOST replayed as its own clustered campaign ----
     # match_phrase (not match) so the tokenized host name doesn't pull in other
     # *-windows-* hosts and dilute the single-host correlation.
-    chain = req("POST", f"/{SRC}/_search", {
-        "size": 200,
-        "query": {"match_phrase": {"host.name": CHAIN_HOST}},
-        "sort": [{"kibana.alert.original_time": "asc"}],
-    })["hits"]["hits"]
-    # Compress the whole chain into the last CHAIN_WINDOW_MIN minutes, order preserved.
-    chain_start = now - timedelta(minutes=CHAIN_WINDOW_MIN)
-    campaign_id = "ATTACK-CHAIN-" + now.strftime("%Y%m%d")
-    for i, h in enumerate(chain):
-        frac = i / max(len(chain) - 1, 1)
-        t = chain_start + timedelta(minutes=frac * (CHAIN_WINDOW_MIN - 1))
-        nid, src = stamp(h["_source"], t.strftime("%Y-%m-%dT%H:%M:%S.000Z"), campaign_id)
-        lines.append(json.dumps({"create": {"_index": DEST, "_id": nid}}))
-        lines.append(json.dumps(src))
-    chain_n = len(chain)
+    for hi, host in enumerate(CHAIN_HOSTS):
+        chain = req("POST", f"/{SRC}/_search", {
+            "size": 200,
+            "query": {"match_phrase": {"host.name": host}},
+            "sort": [{"kibana.alert.original_time": "asc"}],
+        })["hits"]["hits"]
+        if not chain:
+            summaries.append(f"0 on {host} (no alerts)")
+            continue
+        # Stagger each host's window so campaigns don't perfectly overlap, but all
+        # stay recent. host hi ends (hi*30)min ago, spanning CHAIN_WINDOW_MIN back.
+        end = now - timedelta(minutes=hi * 30)
+        start = end - timedelta(minutes=CHAIN_WINDOW_MIN)
+        # Short campaign slug from the host (e.g. xdr-siem-windows-2022-ds -> XDRSIEMWIN)
+        slug = "".join(c for c in host.upper() if c.isalnum())[:10]
+        campaign_id = f"ATTACK-CHAIN-{slug}-{day}"
+        for i, h in enumerate(chain):
+            frac = i / max(len(chain) - 1, 1)
+            t = start + timedelta(minutes=frac * (CHAIN_WINDOW_MIN - 1))
+            nid, src = stamp(h["_source"], t.strftime("%Y-%m-%dT%H:%M:%S.000Z"), campaign_id)
+            lines.append(json.dumps({"create": {"_index": DEST, "_id": nid}}))
+            lines.append(json.dumps(src))
+        summaries.append(f"{len(chain)} on {host} as {campaign_id}")
 
     # ---- 2. RANDOM SAMPLE: N other curated alerts spread across the day ----
     seed = int(now.timestamp())
     sample = req("POST", f"/{SRC}/_search", {
         "size": N,
         "query": {"function_score": {
-            "query": {"bool": {"must_not": [{"match_phrase": {"host.name": CHAIN_HOST}}]}},
+            "query": {"bool": {"must_not": [
+                {"match_phrase": {"host.name": host}} for host in CHAIN_HOSTS]}},
             "random_score": {"seed": seed, "field": "_seq_no"}}},
     })["hits"]["hits"]
     for h in sample:
@@ -91,9 +108,9 @@ data:
 
     result = req("POST", "/_bulk?refresh=true", "\n".join(lines) + "\n", ndjson=True)
     ok = sum(1 for i in result["items"] if i["create"].get("status") in (200, 201))
-    total = chain_n + len(sample)
-    print(f"recycled {ok}/{total} ({chain_n} chain on {CHAIN_HOST} as {campaign_id}, "
-          f"{len(sample)} random) errors={result['errors']}")
+    total = (len(lines) // 2)
+    print(f"recycled {ok}/{total}: " + "; ".join(summaries) +
+          f"; {len(sample)} random) errors={result['errors']}")
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -124,8 +141,8 @@ spec:
               value: "30"
             - name: SPREAD_MINUTES
               value: "360"
-            - name: CHAIN_HOST
-              value: "xdr-siem-windows-2022-ds"
+            - name: CHAIN_HOSTS
+              value: "xdr-siem-windows-2022-ds,idc-forrester-cdr-windows,instance-windows-01"
             - name: CHAIN_WINDOW_MINUTES
               value: "90"
             volumeMounts:
