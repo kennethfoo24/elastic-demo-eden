@@ -1,0 +1,159 @@
+name: Agentic AD Triage 🤖
+description: Hybrid automation - built-in security agent performs autonomous RCA on
+  an Attack Discovery, opens a case, and emails the SOC.
+enabled: true
+tags:
+  - Example
+  - OG
+consts:
+  email_to_send_to: kenneth.foo@elastic.co
+  kibana: https://kenneth-sandbox-sec-c9cf0d.kb.ap-southeast-1.aws.elastic.cloud
+triggers:
+  - type: alert
+steps:
+  - name: rca_analysis
+    type: kibana.request
+    with:
+      method: "POST"
+      path: "/api/agent_builder/converse"
+      headers:
+        kbn-xsrf: "true"
+      body:
+        agent_id: soc_agent
+        input: Please investigate the following attack which was discovered. Use all the
+          available tools to analyze the attack and provide the remediation. Mark attack discovery status as
+          acknowledged if this attack is a true positive, list the affected
+          process id and summarize the actions you took so far.
+
+          {{ event | json}}
+    timeout: 10m
+    on-failure:
+      retry:
+        max-attempts: 3
+  - name: create_case_title
+    type: kibana.request
+    with:
+      method: "POST"
+      path: "/api/agent_builder/converse"
+      headers:
+        kbn-xsrf: "true"
+      body:
+        agent_id: soc_agent
+        conversation_id: "{{ steps.rca_analysis.output.conversation_id }}"
+        input: Based on this analysis I am going to create a case. Create a case title
+          that is clear and informative. Only return the case title NOTHING
+          ELSE. The maximum length is 160 characters.
+    timeout: 10m
+    on-failure:
+      retry:
+        max-attempts: 3
+  - name: create_case
+    type: kibana.createCaseDefaultSpace
+    with:
+      connector:
+        fields: null
+        id: none
+        name: none
+        type: .none
+      description: "This case is automatically being created by the workflow
+        {{workflow.name}} as the attack discovery found suspicious behavior."
+      owner: securitySolution
+      settings:
+        syncAlerts: false
+      severity: low
+      tags:
+        - Example
+      title: "{{ steps.create_case_title.output.response.message }}"
+    on-failure:
+      retry:
+        max-attempts: 3
+  - name: get_conversation
+    type: kibana.request
+    with:
+      method: "GET"
+      path: "/api/agent_builder/conversations/{{ steps.rca_analysis.output.conversation_id }}"
+      headers:
+        kbn-xsrf: "true"
+  - name: add_details_to_case
+    type: kibana.request
+    with:
+      method: "POST"
+      path: "/api/cases/{{ steps.create_case.output.id }}/comments"
+      headers:
+        kbn-xsrf: "true"
+      body:
+        type: user
+        owner: securitySolution
+        comment: |
+          ## Analysis done by the Customized SOC agent
+          {{steps.rca_analysis.output.response.message}}
+          ##Affected Entities
+          {{event.alerts[0].kibana.alert.attack_discovery.entity_summary_markdown_with_replacements}}
+          ## Investigation Context
+          - **Detection Time:** {{event.alerts[0].kibana.alert.start}}
+          - **Alert Count:** {{event.alerts[0].kibana.alert.attack_discovery.alerts_context_count}}
+          - **Risk Score:** {{event.alerts[0].kibana.alert.risk_score}}
+          - **Rule:** {{event.alerts[0].kibana.alert.rule.name}}
+          - **Attack Discovery Link:** [Attack Discovery]({{event.alerts[0].kibana.alert.url }})
+          ## Continue chat here
+          [View Full Conversation]({{consts.kibana }}/app/agent_builder/conversations/{{ steps.get_conversation.output.id }})
+  - name: add_alerts_to_case
+    type: foreach
+    foreach: '{{event.alerts[0].kibana.alert.attack_discovery.alert_ids}}'
+    steps:
+      - name: get_details
+        type: elasticsearch.search
+        with:
+          index: .alerts-security.alerts-default
+          size: 10
+          query:
+            match:
+              _id: '{{foreach.item}}'
+      - name: add_to_case
+        type: kibana.request
+        with:
+          method: POST
+          path: /api/cases/{{ steps.create_case.output.id }}/comments
+          body:
+            type: alert
+            alertId: '{{ foreach.item}}'
+            index: .alerts-security.alerts-default
+            rule:
+              name: '{{ steps.get_details.output.hits.hits[0]._source.kibana.alert.rule.name }}'
+              id: '{{foreach.item}}'
+            owner: securitySolution
+          headers:
+            kbn-xsrf: true
+  - name: send_email_notification
+    type: email
+    connector-id: Elastic-Cloud-SMTP
+    with:
+      to:
+        - "{{ consts.email_to_send_to }}"
+      subject: "🚨 ACTION REQUIRED: New Kibana Case created for {{event.alerts[0].kibana.alert.attack_discovery.title_with_replacements }}"
+      message: |
+        🚨 **Attack Discovered**
+        ---
+        ## Summary
+        {{ event.alerts[0].kibana.alert.attack_discovery.summary_markdown_with_replacements }}
+        ---
+        ## Current Status
+        - ✅ Incident response workflow {{workflow.name}} initiated
+        - ✅ Security case created (_{{ event.alerts[0].kibana.alert.attack_discovery.alerts_context_count }} alerts consolidated_)
+        - ✅ Initial threat analysis completed by Security Threat Hunting agent
+        ---
+        ## Incident Metadata
+        - ⚠️ **Risk Score:** {{ event.alerts[0].kibana.alert.risk_score }}
+        - 📈 **Alert Count:** {{ event.alerts[0].kibana.alert.attack_discovery.alerts_context_count }}
+        - 🟢 **Status:** {{ event.alerts[0].kibana.alert.status }}
+        - ⏰ **Start Time:** {{ event.alerts[0].kibana.alert.start }}
+        - 🆔 **Case ID:** {{ steps.create_case.output.id }}
+        - 🎯 **MITRE Tactics:** {{ event.alerts[0].kibana.alert.attack_discovery.mitre_attack_tactics | array_to_sentence_string }}
+        ---
+        ## Actions
+        - 🔎 [View Attack in Kibana]({{ event.alerts[0].kibana.alert.url }})
+        - 📁 [Go to Case]({{ consts.kibana }}/app/security/cases/{{ steps.create_case.output.id }})
+        - 💬 [Continue the Chat]({{ consts.kibana }}/app/agent_builder/conversations/{{ steps.get_conversation.output.id }})
+        - 🔄 [View Execution Status]({{ consts.kibana }}/app/workflows/{{ workflow.id }}?executionId={{ execution.id }}&tab=executions)
+        ---
+        _Sent via **Security Operations Workflow** — {{ workflow.name }}_

@@ -15,7 +15,7 @@
 # Collection [l00t.zip] -> Exfiltration [curl -> C2 35.235.244.32]).
 #
 # The detection rule itself (rule_id eden-phishing-email-malicious-attachment) is
-# created once via the Kibana API; see phishing-initial-access.md. This CronJob only
+# created once via the Kibana API; see README.md. This CronJob only
 # keeps the email events recent (every 15m) so the rule keeps producing fresh alerts
 # inside Attack Discovery's 24h lookback. Requires secret security-fc-es-creds.
 apiVersion: v1
