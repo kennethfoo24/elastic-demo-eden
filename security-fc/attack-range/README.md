@@ -37,17 +37,30 @@ gcloud compute instances create kenneth-defend-windows --zone=asia-southeast1-c 
   --metadata-from-file=windows-startup-script-ps1=startup-windows.ps1
 ```
 
-## Running the attacks
-- **Linux:** `gcloud compute scp attack-linux.sh kenneth-defend-ubuntu:/tmp/ --tunnel-through-iap`
-  then `gcloud compute ssh kenneth-defend-ubuntu --tunnel-through-iap --command="sudo bash /tmp/attack-linux.sh"`.
-- **Windows** (no sshd): build a one-shot runner (guard + ASCII-only body of
-  `attack-windows.ps1`), push as `windows-startup-script-ps1`, then
-  `gcloud compute instances reset kenneth-defend-windows`. Clear the marker
-  `C:\attack-range\attack-done` to re-fire. See `run-attack-windows.sh`.
+## Automatic execution — every 6 hours (no manual refresh)
+Both hosts self-run their attack chain every 6 hours via an on-VM scheduler, so
+the demo stays continuously fresh with zero intervention:
+- **Linux:** system cron `/etc/cron.d/attack-range` -> `0 */6 * * *` runs
+  `/opt/attack-range/attack-linux.sh`. Uses `/etc/cron.d` (not the root user
+  crontab) so the attack's own `crontab -r` step can't remove the scheduler.
+- **Windows:** Scheduled Task **`AttackRange`** (SYSTEM, RunLevel Highest) with a
+  6-hour repetition interval runs `C:\attack-range\attack-windows.ps1`. Installed
+  by `startup-windows-scheduled.ps1`, which also (idempotently) installs the agent
+  and writes the attack body from the `attack_script` instance-metadata key.
 
-  Gotchas learned: set `$ProgressPreference='SilentlyContinue'` (else the ~600MB
-  agent download crawls); keep the script **pure ASCII** (an em-dash broke the
-  metadata script parser); the marker makes it run once per boot.
+Cadence: Linux fires on the clock (00/06/12/18 UTC); Windows every 6h from task
+registration. Combined with the alert recycler this gives a steady stream of live
+MITRE alerts for Attack Discovery around the clock.
+
+## Running an attack on demand (manual)
+- **Linux:** `gcloud compute ssh kenneth-defend-ubuntu --tunnel-through-iap --command="sudo /opt/attack-range/attack-linux.sh"`
+- **Windows:** `gcloud compute ssh` has no sshd; trigger the task remotely by
+  resetting (startup re-runs it) or use `run-attack-windows.sh` for a one-shot run.
+
+Gotchas learned: set `$ProgressPreference='SilentlyContinue'` (else the ~600MB
+agent download crawls); keep metadata PowerShell **pure ASCII** (an em-dash broke
+the parser through three boots); pass the attack body via the `attack_script`
+metadata key rather than inlining it in the startup script.
 
 ## Attack Discovery
 - Schedule **"Attack Range Correlation"** (id `b2886362-...`) runs every 15m
