@@ -1,12 +1,18 @@
 # Feeds the Security serverless project with meaningful, Attack-Discovery-ready
 # alerts every 6h. Two parts, always emitted together:
-#   1. THE CHAINS — for each host in CHAIN_HOSTS, every curated alert on that host
-#      is re-timestamped into its own tight, staggered window and tagged with a
-#      per-host campaign id, so Attack Discovery correlates each as a distinct
-#      multi-stage campaign. The lead host xdr-siem-windows-2022-ds runs the full
-#      kill chain (Execution certutil/rundll32 malware -> Defense Evasion Defender
-#      tampering -> Persistence driver+path activity -> Priv-Esc PrintSpooler ->
-#      C2 Threat Intel IP match). Entity links (host/user/process) preserved verbatim.
+#   1. THE CHAINS — for each entity in CHAIN_ENTITIES_JSON (host or user), every
+#      curated alert on that entity is re-timestamped into its own tight, staggered
+#      window and tagged with a per-entity campaign id, so Attack Discovery
+#      correlates each as a distinct multi-stage campaign. 7 ranked chains:
+#        WIN-KILLCHAIN  xdr-siem-windows-2022-ds  full kill chain (Exec->DefEvasion
+#                       ->Persist->PrivEsc->C2), 39 alerts / 8 rules / 10 critical
+#        WIN-DEFENDER   instance-windows-01       Defender tampering + malware, 33/6
+#        WIN-MALWARE    idc-forrester-cdr-windows certutil malware burst, 15/3/10crit
+#        LINUX-EC2      ip-10-0-1-40              linux EC2 activity, 18/3
+#        K8S-RBAC       daemon-set-controller SA   k8s RBAC denials, 26/5
+#        K8S-ANON       system:anonymous          k8s anonymous access, 8/3
+#        OKTA-IDENTITY  sandiya.ramamoorthy@...   identity/Okta, 3/2/4 tactics
+#      Entity links (host/user/process) preserved verbatim so the graph connects.
 #   2. RANDOM SAMPLE — N other curated detections spread over the day for volume.
 # Requires secret security-fc-es-creds (ES_URL, ES_API_KEY) in namespace security-fc.
 apiVersion: v1
@@ -23,15 +29,20 @@ data:
     KEY = os.environ["ES_API_KEY"].strip()
     N = int(os.environ.get("RECYCLE_COUNT", "30"))
     SPREAD_MIN = int(os.environ.get("SPREAD_MINUTES", "360"))
-    # Comma-separated list; each host is replayed as its own clustered campaign.
-    # (CHAIN_HOST kept as a fallback for backward compat.)
-    CHAIN_HOSTS = [h.strip() for h in os.environ.get(
-        "CHAIN_HOSTS",
-        os.environ.get("CHAIN_HOST", "xdr-siem-windows-2022-ds")
-    ).split(",") if h.strip()]
     CHAIN_WINDOW_MIN = int(os.environ.get("CHAIN_WINDOW_MINUTES", "90"))
     SRC = "eden-alerts-security"
     DEST = ".alerts-security.alerts-default"
+
+    # Each entity = one attack campaign, ranked by alerts x rules x high-severity.
+    # {"field": <entity field>, "value": <exact value>, "label": <short slug>}.
+    # CHAIN_ENTITIES_JSON overrides; else fall back to CHAIN_HOSTS (host.name only).
+    _ej = os.environ.get("CHAIN_ENTITIES_JSON", "").strip()
+    if _ej:
+        CHAIN_ENTITIES = json.loads(_ej)
+    else:
+        CHAIN_ENTITIES = [{"field": "host.name", "value": h.strip(), "label": ""}
+            for h in os.environ.get("CHAIN_HOSTS", "xdr-siem-windows-2022-ds").split(",")
+            if h.strip()]
 
     def req(method, path, body=None, ndjson=False):
         data = None
@@ -64,24 +75,24 @@ data:
     lines = []
     summaries = []
 
-    # ---- 1. THE CHAINS: each CHAIN_HOST replayed as its own clustered campaign ----
-    # match_phrase (not match) so the tokenized host name doesn't pull in other
-    # *-windows-* hosts and dilute the single-host correlation.
-    for hi, host in enumerate(CHAIN_HOSTS):
+    # ---- 1. THE CHAINS: each entity replayed as its own clustered campaign ----
+    # match_phrase (not match) so tokenized names don't pull in sibling entities
+    # (e.g. other *-windows-* hosts) and dilute the single-entity correlation.
+    for hi, ent in enumerate(CHAIN_ENTITIES):
+        field, value = ent["field"], ent["value"]
         chain = req("POST", f"/{SRC}/_search", {
-            "size": 200,
-            "query": {"match_phrase": {"host.name": host}},
+            "size": 300,
+            "query": {"match_phrase": {field: value}},
             "sort": [{"kibana.alert.original_time": "asc"}],
         })["hits"]["hits"]
         if not chain:
-            summaries.append(f"0 on {host} (no alerts)")
+            summaries.append(f"0 on {value} (no alerts)")
             continue
-        # Stagger each host's window so campaigns don't perfectly overlap, but all
-        # stay recent. host hi ends (hi*30)min ago, spanning CHAIN_WINDOW_MIN back.
+        # Stagger each campaign's window so they don't perfectly overlap, but all
+        # stay recent. entity hi ends (hi*30)min ago, spanning CHAIN_WINDOW_MIN back.
         end = now - timedelta(minutes=hi * 30)
         start = end - timedelta(minutes=CHAIN_WINDOW_MIN)
-        # Short campaign slug from the host (e.g. xdr-siem-windows-2022-ds -> XDRSIEMWIN)
-        slug = "".join(c for c in host.upper() if c.isalnum())[:10]
+        slug = ent.get("label") or "".join(c for c in value.upper() if c.isalnum())[:10]
         campaign_id = f"ATTACK-CHAIN-{slug}-{day}"
         for i, h in enumerate(chain):
             frac = i / max(len(chain) - 1, 1)
@@ -89,7 +100,7 @@ data:
             nid, src = stamp(h["_source"], t.strftime("%Y-%m-%dT%H:%M:%S.000Z"), campaign_id)
             lines.append(json.dumps({"create": {"_index": DEST, "_id": nid}}))
             lines.append(json.dumps(src))
-        summaries.append(f"{len(chain)} on {host} as {campaign_id}")
+        summaries.append(f"{len(chain)} {field}={value} as {campaign_id}")
 
     # ---- 2. RANDOM SAMPLE: N other curated alerts spread across the day ----
     seed = int(now.timestamp())
@@ -97,7 +108,7 @@ data:
         "size": N,
         "query": {"function_score": {
             "query": {"bool": {"must_not": [
-                {"match_phrase": {"host.name": host}} for host in CHAIN_HOSTS]}},
+                {"match_phrase": {e["field"]: e["value"]}} for e in CHAIN_ENTITIES]}},
             "random_score": {"seed": seed, "field": "_seq_no"}}},
     })["hits"]["hits"]
     for h in sample:
@@ -141,8 +152,20 @@ spec:
               value: "30"
             - name: SPREAD_MINUTES
               value: "360"
-            - name: CHAIN_HOSTS
-              value: "xdr-siem-windows-2022-ds,idc-forrester-cdr-windows,instance-windows-01"
+            # Ranked entities (alerts x rules x high-severity). Each becomes its own
+            # Attack-Discovery campaign. 4 host chains + 3 identity/cloud chains —
+            # the full set of multi-stage (>=3 alerts, >=2 rules) chains in the corpus.
+            - name: CHAIN_ENTITIES_JSON
+              value: |
+                [
+                  {"field":"host.name","value":"xdr-siem-windows-2022-ds","label":"WIN-KILLCHAIN"},
+                  {"field":"host.name","value":"instance-windows-01","label":"WIN-DEFENDER"},
+                  {"field":"host.name","value":"idc-forrester-cdr-windows","label":"WIN-MALWARE"},
+                  {"field":"host.name","value":"ip-10-0-1-40","label":"LINUX-EC2"},
+                  {"field":"user.name","value":"system:serviceaccount:kube-system:daemon-set-controller","label":"K8S-RBAC"},
+                  {"field":"user.name","value":"system:anonymous","label":"K8S-ANON"},
+                  {"field":"user.name","value":"sandiya.ramamoorthy@elastic.co","label":"OKTA-IDENTITY"}
+                ]
             - name: CHAIN_WINDOW_MINUTES
               value: "90"
             volumeMounts:
