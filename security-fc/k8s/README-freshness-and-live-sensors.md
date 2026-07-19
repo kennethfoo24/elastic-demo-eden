@@ -65,6 +65,17 @@ is the most reliable path) — the fresh agent joins `attack-range-windows` and 
 - **ti_util (Threat Intelligence Utilities)** installed (asset-only): indicator dedup
   transform + expiration + TI dashboards, so the custom `logs-ti_*` feed is properly managed.
 
+## F. Phishing initial-access (`phishing-seeder.yaml` + custom rule)
+Closes the one kill-chain gap vs. the reference demo: the live attack scripts modelled
+"phishing" only as a renamed EXE (no email event), so Attack Discovery chains started at
+**Execution**. Now a custom rule (`eden-phishing-email-malicious-attachment`, T1566.001)
+fires on seeded inbound phishing emails (`logs-email_security.email-default`) tied to the
+same host + user (`gbadmin`) and `resume.exe` SHA256 as the downstream chain, so AD reads
+the campaign end to end: **Initial Access → Execution → Defense Evasion → Persistence →
+Discovery → Collection (l00t.zip) → Exfiltration (curl → C2)**. Everything from Execution
+onward already fires live from the 6-hourly attack scripts. Full detail:
+[phishing-initial-access.md](phishing-initial-access.md).
+
 ## Data-sourcing philosophy
 - EDR (Defend), live KSPM, Linux auditd, threat-intel, Windows event logs = **live sensors**.
 - CSPM findings, Okta, AWS CloudTrail, Wiz/Qualys/Tenable, network flows = **recycled

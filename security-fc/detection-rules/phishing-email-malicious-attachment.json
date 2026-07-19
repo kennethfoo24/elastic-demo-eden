@@ -1,0 +1,33 @@
+{
+  "rule_id": "eden-phishing-email-malicious-attachment",
+  "name": "Phishing Email with Malicious Executable Attachment",
+  "description": "Inbound email delivering an executable attachment (e.g. resume.exe) from an external sender. Models the initial-access phishing step that precedes on-host execution, defense evasion, collection (l00t.zip) and C2 exfiltration — enabling Attack Discovery to correlate the full kill chain from Initial Access onward.",
+  "type": "query",
+  "language": "kuery",
+  "query": "event.category:email and email.attachments.file.name:*.exe",
+  "index": ["logs-email_security.*"],
+  "severity": "high",
+  "risk_score": 73,
+  "enabled": true,
+  "from": "now-370m",
+  "interval": "5m",
+  "max_signals": 100,
+  "author": ["EDEN Demo"],
+  "tags": ["eden-demo", "Initial Access", "Phishing", "Data Source: Email"],
+  "threat": [
+    {
+      "framework": "MITRE ATT&CK",
+      "tactic": { "id": "TA0001", "name": "Initial Access", "reference": "https://attack.mitre.org/tactics/TA0001/" },
+      "technique": [
+        {
+          "id": "T1566",
+          "name": "Phishing",
+          "reference": "https://attack.mitre.org/techniques/T1566/",
+          "subtechnique": [
+            { "id": "T1566.001", "name": "Spearphishing Attachment", "reference": "https://attack.mitre.org/techniques/T1566/001/" }
+          ]
+        }
+      ]
+    }
+  ]
+}

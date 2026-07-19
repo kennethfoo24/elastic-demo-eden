@@ -1,0 +1,112 @@
+# Phishing initial-access seeder for the Security serverless project.
+#
+# WHY: the live attack scripts model "phishing" only as a renamed EXE (resume.exe)
+# — there is no email event, so `event.category:email` = 0 and the attack chain
+# starts at Execution instead of Initial Access. The reference EDEN demo begins its
+# "Phishing to Recon and Exfiltration" story with an inbound phishing email, which
+# is what lights up the Initial Access stage in Attack Discovery.
+#
+# WHAT: seeds fresh inbound phishing-email events (ECS `email.*`) into
+# logs-email_security.email-default, tied to the SAME hosts/user (gbadmin) and the
+# SAME resume.exe SHA256 as the downstream execution/exfil alerts, so the custom
+# detection rule "Phishing Email with Malicious Executable Attachment" fires an
+# Initial-Access alert that Attack Discovery correlates onto the full kill chain
+# (Initial Access -> Execution -> Defense Evasion -> Persistence -> Discovery ->
+# Collection [l00t.zip] -> Exfiltration [curl -> C2 35.235.244.32]).
+#
+# The detection rule itself (rule_id eden-phishing-email-malicious-attachment) is
+# created once via the Kibana API; see phishing-initial-access.md. This CronJob only
+# keeps the email events recent (every 15m) so the rule keeps producing fresh alerts
+# inside Attack Discovery's 24h lookback. Requires secret security-fc-es-creds.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: phishing-seeder-script
+  namespace: security-fc
+data:
+  seed-phishing.py: |
+    import json, os, urllib.request
+    from datetime import datetime, timedelta, timezone
+    ES = os.environ["ES_URL"].strip().rstrip("/")
+    KEY = os.environ["ES_API_KEY"].strip()
+    DS = "logs-email_security.email-default"
+    RESUME_SHA = "ff808d0a12676bfac88fd26f955154f8884f2bb7c534b9936510fd6296c543e8"
+    # (host, recipient user) — the identities the downstream on-host chain uses
+    TARGETS = [
+        ("xdr-siem-windows-2022-ds", "gbadmin"),
+        ("idc-forrester-cdr-windows", "gbadmin"),
+        ("kenneth-defend-windows", "gbadmin"),
+    ]
+
+    def bulk(lines):
+        data = ("\n".join(lines) + "\n").encode()
+        r = urllib.request.Request(f"{ES}/_bulk?refresh=true", method="POST", data=data,
+            headers={"Authorization": f"ApiKey {KEY}", "Content-Type": "application/x-ndjson"})
+        with urllib.request.urlopen(r, timeout=120) as resp:
+            return json.loads(resp.read())
+
+    now = datetime.now(timezone.utc)
+    def iso(dt): return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    lines = []
+    for i, (host, user) in enumerate(TARGETS):
+        ts = iso(now - timedelta(minutes=3 + i))   # a few minutes ago, just before execution
+        doc = {"@timestamp": ts,
+          "data_stream": {"type": "logs", "dataset": "email_security.email", "namespace": "default"},
+          "event": {"kind": "event", "category": ["email"], "type": ["info"], "action": "delivered",
+                    "dataset": "email_security.email", "outcome": "success", "module": "email_security",
+                    "ingested": iso(now)},
+          "email": {"direction": "inbound", "subject": "Please find attached the resume",
+                    "from": {"address": ["recruiting@demotrash-careers-outlook.com"]},
+                    "to": {"address": [f"{user}@demotrashuseroutlook.onmicrosoft.com"]},
+                    "delivery_timestamp": ts, "message_id": f"<phish-{i}-{int(now.timestamp())}@evilcorp>",
+                    "attachments": [{"file": {"name": "resume.exe", "extension": "exe",
+                        "mime_type": "application/x-msdownload", "size": 248320,
+                        "hash": {"sha256": RESUME_SHA}}}]},
+          "host": {"name": host}, "user": {"name": user},
+          "source": {"ip": "45.83.193.150"},
+          "url": {"full": "http://35.235.244.32/pwn.sh"},
+          "threat": {"framework": "MITRE ATT&CK",
+                     "tactic": {"id": "TA0001", "name": "Initial Access"},
+                     "technique": {"id": "T1566.001", "name": "Spearphishing Attachment"}},
+          "message": f"Inbound phishing email 'Please find attached the resume' delivered to {user} with executable attachment resume.exe",
+          "tags": ["eden-demo-phishing", "initial-access"]}
+        lines.append(json.dumps({"create": {"_index": DS}}))
+        lines.append(json.dumps(doc))
+    res = bulk(lines)
+    ok = sum(1 for it in res["items"] if it["create"].get("status") in (200, 201))
+    print(f"seeded {ok}/{len(TARGETS)} phishing emails into {DS} @ {iso(now)} errors={res['errors']}")
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: phishing-seeder
+  namespace: security-fc
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: seeder
+            image: python:3.12-slim
+            command: ["python", "/scripts/seed-phishing.py"]
+            envFrom:
+            - secretRef:
+                name: security-fc-es-creds
+            volumeMounts:
+            - name: script
+              mountPath: /scripts
+            resources:
+              requests: {cpu: "10m", memory: "64Mi"}
+              limits: {cpu: "200m", memory: "128Mi"}
+          volumes:
+          - name: script
+            configMap:
+              name: phishing-seeder-script
