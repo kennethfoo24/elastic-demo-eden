@@ -45,13 +45,33 @@ Bounded by the freshness-engine `data-retention` job (30-day cleanup); the 17 Sa
 families were added to its `FAMILIES_JSON`. The seeder creates fresh docs (new ids) each
 run so the rules keep producing recent alerts (rules run every 5m, 14d lookback).
 
-## Optional next step — Attack Discovery in the entity-analytics space
+## Attack Discovery in the entity-analytics space (done)
 
-The entity-analytics space has **no Attack Discovery schedule** (only the default space
-does). To surface these SaaS/identity alerts as *attack campaigns* on that space's Attacks
-page, create an attack-discovery schedule at `/s/entity-analytics` using the
-`.anthropic-claude-4.8-opus` connector, `alertsIndexPattern: .alerts-security.alerts-entity-analytics`.
-The Alerts page and entity-risk scoring are already enriched without it.
+The entity-analytics space now has its own Attack Discovery schedule
+(**"Hourly - Entity Analytics"**), so the SaaS/identity alerts surface as *attack
+campaigns* on that space's Attacks page. First run produced **"Identity Takeover and
+Endpoint Compromise" (20 alerts)** — MFA-fatigue/Duo-fraud + suspicious Google Workspace
+logins + O365 mail-forwarding + Slack/GitHub abuse, correlated with the `resume.exe`
+endpoint chain and CrowdStrike Falcon remote response on the same account.
+
+Create it via the **dedicated Attack Discovery Schedules API** (NOT the raw alerting API):
+
+```bash
+curl -s -X POST "$KB/s/entity-analytics/api/attack_discovery/schedules" \
+  -H "Authorization: ApiKey $KEY" -H 'kbn-xsrf: true' -H 'x-elastic-internal-origin: true' \
+  -H 'Content-Type: application/json' -d '{
+    "name":"Hourly - Entity Analytics",
+    "params":{"alerts_index_pattern":".alerts-security.alerts-entity-analytics",
+      "api_config":{"connectorId":".anthropic-claude-4.8-opus-chat_completion","actionTypeId":".inference","name":"Anthropic Claude Opus 4.8"},
+      "end":"now","query":{"query":"","language":"kuery"},"filters":[],"size":500,"start":"now-24h"},
+    "schedule":{"interval":"1h"},"actions":[],"enabled":true}'
+```
+
+> **Gotcha:** creating the schedule via the raw alerting API
+> (`/api/alerting/rule`, `rule_type_id: attack-discovery`) fails at run time with
+> *"Your Security AI Anonymization settings are configured to not allow any fields."*
+> The dedicated `/api/attack_discovery/schedules` endpoint wires the space's
+> anonymization fields correctly (note the snake_case `alerts_index_pattern` / `api_config`).
 
 ## Verify
 
