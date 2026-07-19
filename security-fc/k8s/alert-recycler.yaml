@@ -1,7 +1,12 @@
-# Re-emits a random sample of the curated eden-alerts-security corpus as fresh
-# alerts every 6h, timestamps spread over the last few hours. These are the
-# meaningful FC-demo detections (Threat Intel matches, Unusual Windows Process,
-# Malicious Behavior) that feed Attack Discovery — unlike the generator noise.
+# Feeds the Security serverless project with meaningful, Attack-Discovery-ready
+# alerts every 6h. Two parts, always emitted together:
+#   1. THE CHAIN — every curated alert on host xdr-siem-windows-2022-ds
+#      (Execution certutil/rundll32 malware -> Defense Evasion Defender tampering
+#      -> Persistence driver+path activity -> Priv-Esc PrintSpooler -> C2 Threat
+#      Intel IP match), re-timestamped into ONE tight window so Attack Discovery
+#      correlates it as a single campaign. Entity links (host/user/process) are
+#      preserved verbatim so the graph connects.
+#   2. RANDOM SAMPLE — N other curated detections spread over the day for volume.
 # Requires secret security-fc-es-creds (ES_URL, ES_API_KEY) in namespace security-fc.
 apiVersion: v1
 kind: ConfigMap
@@ -10,60 +15,85 @@ metadata:
   namespace: security-fc
 data:
   recycle.py: |
-    import json, os, random, urllib.request
+    import json, os, random, uuid, urllib.request
     from datetime import datetime, timedelta, timezone
 
     ES = os.environ["ES_URL"].strip().rstrip("/")
     KEY = os.environ["ES_API_KEY"].strip()
     N = int(os.environ.get("RECYCLE_COUNT", "30"))
     SPREAD_MIN = int(os.environ.get("SPREAD_MINUTES", "360"))
+    CHAIN_HOST = os.environ.get("CHAIN_HOST", "xdr-siem-windows-2022-ds")
+    CHAIN_WINDOW_MIN = int(os.environ.get("CHAIN_WINDOW_MINUTES", "90"))
     SRC = "eden-alerts-security"
     DEST = ".alerts-security.alerts-default"
 
-    def req(method, path, body=None):
-        r = urllib.request.Request(f"{ES}{path}", method=method,
-            data=json.dumps(body).encode() if body is not None else None,
-            headers={"Authorization": f"ApiKey {KEY}", "Content-Type": "application/json"})
-        with urllib.request.urlopen(r, timeout=60) as resp:
+    def req(method, path, body=None, ndjson=False):
+        data = None
+        if body is not None:
+            data = body.encode() if ndjson else json.dumps(body).encode()
+        ct = "application/x-ndjson" if ndjson else "application/json"
+        r = urllib.request.Request(f"{ES}{path}", method=method, data=data,
+            headers={"Authorization": f"ApiKey {KEY}", "Content-Type": ct})
+        with urllib.request.urlopen(r, timeout=120) as resp:
             return json.loads(resp.read())
 
-    seed = int(datetime.now(timezone.utc).timestamp())
-    sample = req("POST", f"/{SRC}/_search", {
-        "size": N,
-        "query": {"function_score": {"query": {"match_all": {}},
-                  "random_score": {"seed": seed, "field": "_seq_no"}}},
-    })["hits"]["hits"]
-
-    now = datetime.now(timezone.utc)
-    lines = []
-    for h in sample:
-        src = h["_source"]
-        t = now - timedelta(minutes=random.randint(1, SPREAD_MIN))
-        iso = t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    def stamp(src, iso, campaign=None):
         for f in ("kibana.alert.last_detected", "kibana.alert.original_time",
                   "kibana.alert.start", "@timestamp"):
             if f in src:
                 src[f] = iso
         src["kibana.alert.workflow_status"] = "open"
         tags = src.get("kibana.alert.workflow_tags") or []
-        if "XDR" not in tags:
-            tags.append("XDR")
+        for t in ("XDR", *( [campaign] if campaign else [] )):
+            if t not in tags:
+                tags.append(t)
         src["kibana.alert.workflow_tags"] = tags
-        # new UUID so each emission is a distinct alert
-        import uuid as _uuid
-        new_id = _uuid.uuid4().hex
+        nid = uuid.uuid4().hex
         if "kibana.alert.uuid" in src:
-            src["kibana.alert.uuid"] = new_id
-        lines.append(json.dumps({"create": {"_index": DEST, "_id": new_id}}))
+            src["kibana.alert.uuid"] = nid
+        return nid, src
+
+    now = datetime.now(timezone.utc)
+    lines = []
+
+    # ---- 1. THE CHAIN: all alerts on CHAIN_HOST, clustered in one recent window ----
+    # match_phrase (not match) so the tokenized host name doesn't pull in other
+    # *-windows-* hosts and dilute the single-host correlation.
+    chain = req("POST", f"/{SRC}/_search", {
+        "size": 200,
+        "query": {"match_phrase": {"host.name": CHAIN_HOST}},
+        "sort": [{"kibana.alert.original_time": "asc"}],
+    })["hits"]["hits"]
+    # Compress the whole chain into the last CHAIN_WINDOW_MIN minutes, order preserved.
+    chain_start = now - timedelta(minutes=CHAIN_WINDOW_MIN)
+    campaign_id = "ATTACK-CHAIN-" + now.strftime("%Y%m%d")
+    for i, h in enumerate(chain):
+        frac = i / max(len(chain) - 1, 1)
+        t = chain_start + timedelta(minutes=frac * (CHAIN_WINDOW_MIN - 1))
+        nid, src = stamp(h["_source"], t.strftime("%Y-%m-%dT%H:%M:%S.000Z"), campaign_id)
+        lines.append(json.dumps({"create": {"_index": DEST, "_id": nid}}))
+        lines.append(json.dumps(src))
+    chain_n = len(chain)
+
+    # ---- 2. RANDOM SAMPLE: N other curated alerts spread across the day ----
+    seed = int(now.timestamp())
+    sample = req("POST", f"/{SRC}/_search", {
+        "size": N,
+        "query": {"function_score": {
+            "query": {"bool": {"must_not": [{"match_phrase": {"host.name": CHAIN_HOST}}]}},
+            "random_score": {"seed": seed, "field": "_seq_no"}}},
+    })["hits"]["hits"]
+    for h in sample:
+        t = now - timedelta(minutes=random.randint(1, SPREAD_MIN))
+        nid, src = stamp(h["_source"], t.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+        lines.append(json.dumps({"create": {"_index": DEST, "_id": nid}}))
         lines.append(json.dumps(src))
 
-    body = ("\n".join(lines) + "\n").encode()
-    r = urllib.request.Request(f"{ES}/_bulk?refresh=true", method="POST", data=body,
-        headers={"Authorization": f"ApiKey {KEY}", "Content-Type": "application/x-ndjson"})
-    with urllib.request.urlopen(r, timeout=120) as resp:
-        result = json.loads(resp.read())
+    result = req("POST", "/_bulk?refresh=true", "\n".join(lines) + "\n", ndjson=True)
     ok = sum(1 for i in result["items"] if i["create"].get("status") in (200, 201))
-    print(f"recycled {ok}/{len(sample)} curated alerts (errors={result['errors']})")
+    total = chain_n + len(sample)
+    print(f"recycled {ok}/{total} ({chain_n} chain on {CHAIN_HOST} as {campaign_id}, "
+          f"{len(sample)} random) errors={result['errors']}")
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -94,6 +124,10 @@ spec:
               value: "30"
             - name: SPREAD_MINUTES
               value: "360"
+            - name: CHAIN_HOST
+              value: "xdr-siem-windows-2022-ds"
+            - name: CHAIN_WINDOW_MINUTES
+              value: "90"
             volumeMounts:
             - name: script
               mountPath: /scripts
