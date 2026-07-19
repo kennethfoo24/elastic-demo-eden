@@ -1,0 +1,312 @@
+# SaaS / identity / cloud / EDR event seeder for the Security serverless project.
+#
+# WHY: the entity-analytics space ships 35 custom detection rules spanning a full
+# SaaS/identity/cloud/EDR fleet (CrowdStrike, M365, Google Workspace, GitHub, Duo,
+# Slack, PingOne, 1Password, Zscaler, Jamf, Cloudflare, ServiceNow, SailPoint, SSH,
+# threat-intel). All 35 imported and are enabled, but ~26 sat idle because their
+# source data streams were EMPTY. This is the single biggest reason the reference
+# EDEN demo's Alerts page is richer than ours.
+#
+# WHAT: emits schema-correct ECS events into each empty data stream, satisfying each
+# rule's exact query, with the identity/SaaS failures centred on the compromised user
+# `gbadmin` from the attack-range attacker IPs -> a coherent cross-SaaS credential-attack
+# story that feeds entity-risk scoring and Attack Discovery. Alerts land in the
+# entity-analytics space index (.alerts-security.alerts-entity-analytics).
+#
+# Verified: one seed run lit up all 35 rules (664 alerts/day). Runs every 15m to keep
+# a steady stream of fresh alerts (rules run every 5m with a 14d lookback). Bounded by
+# the freshness-engine data-retention job (30 days). Requires secret security-fc-es-creds.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: saas-identity-seeder-script
+  namespace: security-fc
+data:
+  seed-saas.py: |
+    import json, os, random, urllib.request
+    from datetime import datetime, timedelta, timezone
+
+    ES = os.environ["ES_URL"].strip().rstrip("/")
+    KEY = os.environ["ES_API_KEY"].strip()
+    now = datetime.now(timezone.utc)
+    def ts(maxmin=180):
+        return (now - timedelta(minutes=random.randint(0, maxmin),
+                                seconds=random.randint(0, 59))).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    ING = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    # gbadmin = the compromised identity threaded across every IdP/SaaS (entity-risk + AD story)
+    USERS = ["gbadmin", "gbadmin", "gbadmin", "jsmith", "arojas", "dkim", "mwilliams"]
+    ATTACKER_IPS = ["45.83.193.150", "35.235.244.32", "185.220.101.1", "45.137.21.9", "141.98.10.60"]
+    WIN_HOSTS = ["kenneth-defend-windows", "xdr-siem-windows-2022-ds", "idc-forrester-cdr-windows"]
+    LNX_HOSTS = ["kenneth-defend-ubuntu", "xdr-siem-ubuntu-20-04"]
+    def u(): return random.choice(USERS)
+    def aip(): return random.choice(ATTACKER_IPS)
+
+    def base(ds, kind="event", cat=None, typ=None):
+        d = {"@timestamp": ts(),
+             "data_stream": {"type": "logs", "dataset": ds, "namespace": "default"},
+             "event": {"dataset": ds, "ingested": ING, "kind": kind},
+             "tags": ["eden-demo-saas"]}
+        if cat is not None: d["event"]["category"] = cat
+        if typ is not None: d["event"]["type"] = typ
+        return d
+
+    docs = {}  # ds -> [doc,...]
+    def add(ds, doc): docs.setdefault(ds, []).append(doc)
+
+    # ---------------- CrowdStrike Falcon ----------------
+    for _ in range(4):  # DetectionSummaryEvent, Severity>=4
+        d = base("crowdstrike.falcon", "alert", ["malware","intrusion_detection"], ["info"])
+        d.update({"host": {"name": random.choice(WIN_HOSTS)}, "user": {"name": u()},
+                  "process": {"name": random.choice(["resume.exe","cdnver.dll","rundll32.exe","mshta.exe"])},
+                  "crowdstrike": {"metadata": {"eventType": "DetectionSummaryEvent"},
+                                  "event": {"Severity": random.choice([4,5]),
+                                            "DetectName": "Malicious Document", "Tactic": "Execution"}},
+                  "message": "CrowdStrike Falcon high-severity detection"})
+        add("crowdstrike.falcon", d)
+    for _ in range(4):  # RemoteResponseSessionStartEvent
+        d = base("crowdstrike.falcon", "event", ["session"], ["start"])
+        d.update({"host": {"name": random.choice(WIN_HOSTS)}, "user": {"name": u()},
+                  "crowdstrike": {"metadata": {"eventType": "RemoteResponseSessionStartEvent"},
+                                  "event": {"SessionId": "rr-"+str(random.randint(1000,9999))}},
+                  "message": "CrowdStrike Falcon remote response session started"})
+        add("crowdstrike.falcon", d)
+    for _ in range(4):  # FirewallMatchEvent + RuleAction block
+        d = base("crowdstrike.falcon", "event", ["network"], ["denied"])
+        d.update({"host": {"name": random.choice(WIN_HOSTS)},
+                  "source": {"ip": "10.128.0."+str(random.randint(20,60))}, "destination": {"ip": aip()},
+                  "crowdstrike": {"metadata": {"eventType": "FirewallMatchEvent"},
+                                  "event": {"RuleAction": "block", "RuleName": "Block C2"}},
+                  "message": "CrowdStrike Falcon firewall blocked connection"})
+        add("crowdstrike.falcon", d)
+
+    # ---------------- CrowdStrike Alert ----------------
+    for _ in range(5):  # event.severity>=7
+        d = base("crowdstrike.alert", "alert", ["intrusion_detection"], ["info"])
+        d["event"]["severity"] = random.choice([7,8,9])
+        d.update({"host": {"name": random.choice(WIN_HOSTS)}, "user": {"name": u()},
+                  "message": "CrowdStrike high severity alert"})
+        add("crowdstrike.alert", d)
+    for _ in range(5):  # event.category malware
+        d = base("crowdstrike.alert", "alert", ["malware"], ["info"])
+        d["event"]["severity"] = random.choice([8,9])
+        d.update({"host": {"name": random.choice(WIN_HOSTS)}, "user": {"name": u()},
+                  "file": {"name": "resume.exe", "hash": {"sha256": "ff808d0a12676bfac88fd26f955154f8884f2bb7c534b9936510fd6296c543e8"}},
+                  "message": "CrowdStrike malware detection"})
+        add("crowdstrike.alert", d)
+
+    # ---------------- Microsoft 365 (o365.audit) ----------------
+    for _ in range(10):  # UserLoginFailed
+        d = base("o365.audit", "event", ["authentication"], ["start"])
+        d["event"].update({"action": "UserLoginFailed", "outcome": "failure"})
+        d.update({"user": {"name": u()}, "source": {"ip": aip()},
+                  "message": "Microsoft 365 failed login"})
+        add("o365.audit", d)
+    for _ in range(4):  # Set-Mailbox mail forwarding
+        d = base("o365.audit", "event", ["email"], ["change"])
+        d["event"].update({"action": "Set-Mailbox", "outcome": "success"})
+        d.update({"user": {"name": "gbadmin"}, "source": {"ip": aip()},
+                  "o365": {"audit": {"Parameters": {"ForwardingSmtpAddress": "exfil@attacker-mail.com"}}},
+                  "message": "Microsoft 365 mailbox forwarding rule created"})
+        add("o365.audit", d)
+
+    # ---------------- Google Workspace login ----------------
+    for _ in range(8):  # login_failure
+        d = base("google_workspace.login", "event", ["authentication"], ["start"])
+        d["event"].update({"action": "login_failure", "outcome": "failure"})
+        d.update({"user": {"name": u()}, "source": {"ip": aip()}, "message": "Google Workspace failed login"})
+        add("google_workspace.login", d)
+    for _ in range(4):  # is_suspicious
+        d = base("google_workspace.login", "event", ["authentication"], ["info"])
+        d["event"].update({"action": "login_success", "outcome": "success"})
+        d.update({"user": {"name": u()}, "source": {"ip": aip()},
+                  "google_workspace": {"login": {"is_suspicious": True, "challenge_status": "Challenge Passed"}},
+                  "message": "Google Workspace suspicious login"})
+        add("google_workspace.login", d)
+
+    # ---------------- Cisco Duo auth ----------------
+    for _ in range(7):  # denied (failure)
+        d = base("cisco_duo.auth", "event", ["authentication"], ["info"])
+        d["event"].update({"action": "authentication", "outcome": "failure"})
+        d.update({"user": {"name": u()}, "source": {"ip": aip()}, "message": "Duo MFA authentication denied"})
+        add("cisco_duo.auth", d)
+    for _ in range(3):  # fraud
+        d = base("cisco_duo.auth", "event", ["authentication"], ["info"])
+        d["event"].update({"action": "fraud", "outcome": "failure"})
+        d.update({"user": {"name": "gbadmin"}, "source": {"ip": aip()}, "message": "Duo MFA fraud reported"})
+        add("cisco_duo.auth", d)
+
+    # ---------------- PingOne audit ----------------
+    for _ in range(6):
+        d = base("ping_one.audit", "event", ["authentication"], ["start"])
+        d["event"].update({"action": "USER.AUTHENTICATION_FAILED", "outcome": "failure"})
+        d.update({"user": {"name": u()}, "source": {"ip": aip()}, "message": "PingOne authentication failed"})
+        add("ping_one.audit", d)
+    for _ in range(4):
+        d = base("ping_one.audit", "event", ["authentication"], ["info"])
+        d["event"].update({"action": "USER.MFA_REJECTED", "outcome": "failure"})
+        d.update({"user": {"name": u()}, "source": {"ip": aip()}, "message": "PingOne MFA rejected"})
+        add("ping_one.audit", d)
+
+    # ---------------- 1Password ----------------
+    for _ in range(8):
+        d = base("1password.signin_attempts", "event", ["authentication"], ["start"])
+        d["event"].update({"action": "credentials_failed", "outcome": "failure"})
+        d.update({"user": {"name": u()}, "source": {"ip": aip()}, "message": "1Password failed sign-in attempt"})
+        add("1password.signin_attempts", d)
+
+    # ---------------- SailPoint ----------------
+    for _ in range(8):
+        d = base("sailpoint_identity_sc.events", "event", ["authentication"], ["start"])
+        d["event"].update({"action": "AUTH_LOGIN_FAILED", "outcome": "failure"})
+        d.update({"user": {"name": u()}, "source": {"ip": aip()}, "message": "SailPoint authentication failure"})
+        add("sailpoint_identity_sc.events", d)
+
+    # ---------------- Zscaler ZIA web ----------------
+    for _ in range(10):
+        d = base("zscaler_zia.web", "event", ["network","web"], ["access","denied"])
+        d["event"].update({"action": "Blocked", "outcome": "failure"})
+        d.update({"user": {"name": u()}, "source": {"ip": "10.128.0."+str(random.randint(20,60))},
+                  "url": {"full": random.choice(["http://malwaredelivery.top/loader.hta","http://cdn-update-svc.com/beacon","http://35.235.244.32/pwn.sh"])},
+                  "destination": {"domain": "malwaredelivery.top"}, "message": "Zscaler web traffic blocked"})
+        add("zscaler_zia.web", d)
+
+    # ---------------- Zscaler ZIA firewall ----------------
+    for _ in range(10):
+        d = base("zscaler_zia.firewall", "event", ["network"], ["denied"])
+        d["event"].update({"action": "Drop", "outcome": "failure"})
+        d.update({"source": {"ip": "10.128.0."+str(random.randint(20,60))}, "destination": {"ip": aip(), "port": random.choice([4444,8080,1337,53])},
+                  "message": "Zscaler firewall connection dropped"})
+        add("zscaler_zia.firewall", d)
+
+    # ---------------- Cloudflare WAF ----------------
+    for _ in range(10):
+        d = base("cloudflare_logpush.firewall_event", "event", ["network","web"], ["denied"])
+        d["event"].update({"action": "block", "outcome": "failure"})
+        d.update({"source": {"ip": aip()}, "url": {"full": "https://portal.demo-corp.com/login"},
+                  "http": {"request": {"method": "POST"}}, "message": "Cloudflare WAF blocked request"})
+        add("cloudflare_logpush.firewall_event", d)
+
+    # ---------------- system.auth (SSH) ----------------
+    for _ in range(12):
+        d = base("system.auth", "event", ["authentication"], ["start"])
+        d["event"].update({"action": "ssh_login", "outcome": "failure"})
+        d.update({"host": {"name": random.choice(LNX_HOSTS)}, "user": {"name": random.choice(["root","ubuntu","gbadmin","admin"])},
+                  "source": {"ip": aip()}, "message": "Failed SSH login attempt"})
+        add("system.auth", d)
+
+    # ---------------- GitHub audit ----------------
+    for _ in range(4):
+        d = base("github.audit", "event", ["configuration"], ["deletion"])
+        d["event"].update({"action": "org.remove_member"})
+        d.update({"user": {"name": u()}, "github": {"org": "demo-corp"}, "message": "GitHub organization member removed"})
+        add("github.audit", d)
+    for _ in range(4):
+        d = base("github.audit", "event", ["configuration"], ["change"])
+        d["event"].update({"action": "repo.access"})
+        d.update({"user": {"name": "gbadmin"}, "github": {"repo": "demo-corp/payments", "visibility": "public"},
+                  "message": "GitHub repository visibility changed"})
+        add("github.audit", d)
+
+    # ---------------- Slack audit ----------------
+    for _ in range(4):
+        d = base("slack.audit", "event", ["iam"], ["admin"])
+        d["event"].update({"action": "role_change_to_admin"})
+        d.update({"user": {"name": u()}, "message": "Slack user escalated to admin"})
+        add("slack.audit", d)
+    for _ in range(4):
+        d = base("slack.audit", "event", ["iam"], ["info"])
+        d["event"].update({"action": "anomaly"})
+        d.update({"user": {"name": u()}, "message": "Slack user anomaly detected"})
+        add("slack.audit", d)
+
+    # ---------------- Jamf Pro ----------------
+    for _ in range(8):
+        d = base("jamf_pro.events", "event", ["configuration"], ["info"])
+        d["event"].update({"action": "ComputerPolicyFinished"})
+        d.update({"host": {"name": "mac-"+random.choice(["arojas","dkim","jsmith"])}, "message": "Jamf Pro computer policy finished"})
+        add("jamf_pro.events", d)
+
+    # ---------------- ServiceNow ----------------
+    for _ in range(6):
+        d = base("servicenow.event", "event", ["configuration"], ["creation"])
+        d["event"].update({"action": "incident_created"})
+        d.update({"servicenow": {"event": {"priority": "1", "short_description": "Suspected account compromise - gbadmin"}},
+                  "message": "ServiceNow critical priority incident created"})
+        add("servicenow.event", d)
+
+    # ---------------- ti_abusech malware ----------------
+    HASHES = ["5d41402abc4b2a76b9719d911017c592aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "9e107d9d372bb6826bd81d3542a419d6bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "ff808d0a12676bfac88fd26f955154f8884f2bb7c534b9936510fd6296c543e8"]
+    for i in range(10):
+        d = base("ti_abusech.malware", "enrichment", ["threat"], ["indicator"])
+        d.update({"threat": {"indicator": {"type": "file", "marking": {"tlp": "WHITE"},
+                    "file": {"hash": {"sha256": random.choice(HASHES)}}},
+                    "feed": {"name": "AbuseCH MalwareBazaar"}},
+                  "message": "New malware hash indicator"})
+        add("ti_abusech.malware", d)
+
+    # ---------------- bulk index ----------------
+    def bulk(lines):
+        data = ("\n".join(lines) + "\n").encode()
+        r = urllib.request.Request(f"{ES}/_bulk?refresh=true", method="POST", data=data,
+            headers={"Authorization": f"ApiKey {KEY}", "Content-Type": "application/x-ndjson"})
+        with urllib.request.urlopen(r, timeout=180) as resp:
+            return json.loads(resp.read())
+
+    total_ok = 0; total = 0; errs = {}
+    summary = []
+    for ds, dl in docs.items():
+        lines = []
+        for d in dl:
+            lines.append(json.dumps({"create": {"_index": f"logs-{ds}-default"}}))
+            lines.append(json.dumps(d))
+        res = bulk(lines)
+        ok = sum(1 for it in res["items"] if it["create"].get("status") in (200, 201))
+        total_ok += ok; total += len(dl)
+        if res["errors"]:
+            for it in res["items"]:
+                e = it["create"].get("error")
+                if e: errs[ds] = str(e.get("reason",""))[:120]; break
+        summary.append(f"{ds}:{ok}/{len(dl)}")
+    print(f"SEEDED {total_ok}/{total} SaaS/identity events @ {ING}")
+    print(" | ".join(summary))
+    if errs:
+        print("ERRORS:")
+        for ds, e in errs.items(): print(f"  {ds}: {e}")
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: saas-identity-seeder
+  namespace: security-fc
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: seeder
+            image: python:3.12-slim
+            command: ["python", "/scripts/seed-saas.py"]
+            envFrom:
+            - secretRef:
+                name: security-fc-es-creds
+            volumeMounts:
+            - name: script
+              mountPath: /scripts
+            resources:
+              requests: {cpu: "20m", memory: "96Mi"}
+              limits: {cpu: "400m", memory: "256Mi"}
+          volumes:
+          - name: script
+            configMap:
+              name: saas-identity-seeder-script

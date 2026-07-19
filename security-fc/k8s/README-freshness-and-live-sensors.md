@@ -76,6 +76,19 @@ Discovery → Collection (l00t.zip) → Exfiltration (curl → C2)**. Everything
 onward already fires live from the 6-hourly attack scripts. Full detail:
 [phishing-initial-access.md](phishing-initial-access.md).
 
+## G. SaaS / identity / cloud / EDR data (`saas-identity-seeder.yaml` + 35 EA rules)
+The `entity-analytics` space ships 35 custom rules across a broad SaaS/identity/cloud/EDR
+fleet (CrowdStrike, M365, Google Workspace, GitHub, Duo, Slack, PingOne, 1Password,
+Zscaler, Jamf, Cloudflare, ServiceNow, SailPoint, SSH, threat-intel). All were enabled but
+~26 sat idle for lack of data — the main reason the reference demo's Alerts page was
+richer. The `saas-identity-seeder` CronJob (`*/15m`) emits schema-correct ECS events into
+every empty stream, satisfying each rule's query, with the failures centred on `gbadmin`
+from the attacker IPs (a cross-SaaS credential-attack story feeding entity-risk). Verified:
+all 35 rules fire (664 alerts/day) into `.alerts-security.alerts-entity-analytics` (view at
+`/s/entity-analytics/app/security/alerts`). Bounded by the 30-day retention job. Full
+detail incl. the optional EA-space Attack-Discovery step:
+[saas-identity-data.md](saas-identity-data.md).
+
 ## Data-sourcing philosophy
 - EDR (Defend), live KSPM, Linux auditd, threat-intel, Windows event logs = **live sensors**.
 - CSPM findings, Okta, AWS CloudTrail, Wiz/Qualys/Tenable, network flows = **recycled

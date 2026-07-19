@@ -205,7 +205,22 @@ spec:
                   {"label":"cspm_findings","pattern":"logs-cloud_security_posture.findings-*"},
                   {"label":"qualys","pattern":"logs-qualys_vmdr.*"},
                   {"label":"tenable","pattern":"logs-tenable_io.*"},
-                  {"label":"wiz","pattern":"logs-wiz.*"}
+                  {"label":"wiz","pattern":"logs-wiz.*"},
+                  {"label":"crowdstrike","pattern":"logs-crowdstrike.*"},
+                  {"label":"o365","pattern":"logs-o365.audit-*"},
+                  {"label":"gworkspace","pattern":"logs-google_workspace.*"},
+                  {"label":"duo","pattern":"logs-cisco_duo.*"},
+                  {"label":"pingone","pattern":"logs-ping_one.*"},
+                  {"label":"1password","pattern":"logs-1password.*"},
+                  {"label":"sailpoint","pattern":"logs-sailpoint_identity_sc.*"},
+                  {"label":"zscaler","pattern":"logs-zscaler_zia.*"},
+                  {"label":"cloudflare","pattern":"logs-cloudflare_logpush.*"},
+                  {"label":"system_auth","pattern":"logs-system.auth-*"},
+                  {"label":"github","pattern":"logs-github.audit-*"},
+                  {"label":"slack","pattern":"logs-slack.audit-*"},
+                  {"label":"jamf","pattern":"logs-jamf_pro.*"},
+                  {"label":"servicenow","pattern":"logs-servicenow.*"},
+                  {"label":"ti_abusech","pattern":"logs-ti_abusech.*"}
                 ]
             volumeMounts:
             - name: scripts
