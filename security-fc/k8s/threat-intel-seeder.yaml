@@ -1,0 +1,117 @@
+# Custom threat-intel feed for the Security serverless project.
+# abuse.ch now requires an Auth-Key we don't have, so instead we seed a curated
+# indicator set into logs-ti_custom.indicator-default (matches the rules' default
+# threat_index `logs-ti_*`). Crucially it includes the attack range's own C2 IOCs,
+# so the LIVE attacks' beacons to them trip the prebuilt indicator-match rules
+# (source/destination.ip <= threat.indicator.ip, url.full <= threat.indicator.url.full,
+# file.hash.* <= threat.indicator.file.hash.*) -> real correlation into Attack Discovery.
+# Re-timestamps every 30m so the Threat Intelligence panel stays populated.
+# Requires secret security-fc-es-creds (ES_URL, ES_API_KEY).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: threat-intel-seeder-script
+  namespace: security-fc
+data:
+  seed-ti.py: |
+    import json, os, urllib.request
+    from datetime import datetime, timedelta, timezone
+    ES = os.environ["ES_URL"].strip().rstrip("/")
+    KEY = os.environ["ES_API_KEY"].strip()
+    DS = "logs-ti_custom.indicator-default"
+
+    # (kind, value, description). kind in {ip,url,sha256}
+    IOCS = [
+      # ---- attack-range C2 IOCs (match live attack traffic) ----
+      ("ip",  "35.235.244.32", "Attack-range Slack-webhook C2 endpoint"),
+      ("ip",  "45.83.193.150", "Attack-range attacker infrastructure"),
+      ("url", "http://35.235.244.32/services/T00/B00/webhook", "C2 exfiltration webhook"),
+      ("url", "http://35.235.244.32/pwn.sh", "Malicious payload retrieval URL"),
+      ("url", "https://images.swiftcrypto.com/pwn.sh", "Payload staging URL"),
+      # ---- realistic public IOCs for volume ----
+      ("ip",  "185.220.101.1",  "Known Tor exit / abuse source"),
+      ("ip",  "193.35.18.34",   "Malware C2 (commodity loader)"),
+      ("ip",  "45.137.21.9",    "Botnet controller"),
+      ("ip",  "91.219.236.166", "Credential-phishing host"),
+      ("ip",  "212.192.241.87", "Cryptomining pool / abuse"),
+      ("ip",  "104.244.72.115", "Anonymizer / C2 relay"),
+      ("ip",  "5.188.206.18",   "Brute-force source"),
+      ("ip",  "141.98.10.60",   "RDP brute-force source"),
+      ("url", "http://malwaredelivery.top/loader.hta", "Malicious HTA delivery"),
+      ("url", "http://cdn-update-svc.com/beacon", "Beacon check-in URL"),
+      ("url", "https://paste.ee/r/evilpayload", "Payload paste site"),
+      ("sha256", "5d41402abc4b2a76b9719d911017c592aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Emotet-like loader (demo)"),
+      ("sha256", "9e107d9d372bb6826bd81d3542a419d6bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "Cobalt Strike beacon (demo)"),
+      ("sha256", "0cc175b9c0f1b6a831c399e269772661cccccccccccccccccccccccccccccccc", "Ransomware dropper (demo)"),
+      ("sha256", "92eb5ffee6ae2fec3ad71c777531578fdddddddddddddddddddddddddddddddd", "Credential stealer (demo)"),
+    ]
+
+    def bulk(lines):
+        data = ("\n".join(lines) + "\n").encode()
+        r = urllib.request.Request(f"{ES}/_bulk?refresh=true", method="POST", data=data,
+            headers={"Authorization": f"ApiKey {KEY}", "Content-Type": "application/x-ndjson"})
+        with urllib.request.urlopen(r, timeout=120) as resp:
+            return json.loads(resp.read())
+
+    now = datetime.now(timezone.utc)
+    niso = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    seen = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    lines = []
+    for i, (kind, val, desc) in enumerate(IOCS):
+        # spread across last 2h so the panel shows a natural trickle
+        ts = (now - timedelta(minutes=(i * 6) % 120)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        ind = {"provider": "eden-demo-ti", "confidence": "High", "description": desc,
+               "first_seen": seen, "last_seen": niso, "modified_at": niso,
+               "marking": {"tlp": "WHITE"}, "sightings": 1}
+        if kind == "ip":
+            ind["type"] = "ipv4-addr"; ind["ip"] = val; ind["name"] = val
+        elif kind == "url":
+            ind["type"] = "url"; ind["url"] = {"full": val, "original": val}; ind["name"] = val
+        elif kind == "sha256":
+            ind["type"] = "file"; ind["file"] = {"hash": {"sha256": val}}; ind["name"] = val
+        doc = {"@timestamp": ts,
+               "data_stream": {"type": "logs", "dataset": "ti_custom.indicator", "namespace": "default"},
+               "event": {"kind": "enrichment", "category": ["threat"], "type": ["indicator"],
+                         "dataset": "ti_custom.indicator", "created": niso},
+               "threat": {"feed": {"name": "EDEN Demo Threat Intel"}, "indicator": ind},
+               "tags": ["eden-demo-ti"]}
+        lines.append(json.dumps({"create": {"_index": DS}}))
+        lines.append(json.dumps(doc))
+    res = bulk(lines)
+    ok = sum(1 for it in res["items"] if it["create"].get("status") in (200, 201))
+    print(f"seeded {ok}/{len(IOCS)} indicators into {DS} @ {niso} errors={res['errors']}")
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: threat-intel-seeder
+  namespace: security-fc
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: seeder
+            image: python:3.12-slim
+            command: ["python", "/scripts/seed-ti.py"]
+            envFrom:
+            - secretRef:
+                name: security-fc-es-creds
+            volumeMounts:
+            - name: script
+              mountPath: /scripts
+            resources:
+              requests: {cpu: "10m", memory: "64Mi"}
+              limits: {cpu: "200m", memory: "128Mi"}
+          volumes:
+          - name: script
+            configMap:
+              name: threat-intel-seeder-script

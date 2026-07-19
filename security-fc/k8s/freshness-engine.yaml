@@ -1,0 +1,219 @@
+# Freshness Engine — keeps the resident data corpus flowing fresh, in-project,
+# with ZERO dependency on the (now decommissioned) hosted EDEN cluster.
+#
+#   data-recycler   (*/15m): randomly samples the newest-diverse docs of each data
+#                    family already resident in the serverless project, re-timestamps
+#                    them across the last few hours, and bulk-creates them back into
+#                    the SAME data stream (op_type=create, ES auto-ids). Real field
+#                    values / entities preserved -> genuinely realistic, always-recent.
+#   data-retention  (daily): delete_by_query docs older than RETENTION_DAYS so the
+#                    recycled families stay bounded.
+#
+# Mirrors the proven alert-recycler pattern: stdlib-only python in a ConfigMap, run
+# by the stock python:3.12-slim image, creds via the security-fc-es-creds secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: freshness-engine-scripts
+  namespace: security-fc
+data:
+  recycle-data.py: |
+    import json, os, random, urllib.request
+    from datetime import datetime, timedelta, timezone
+
+    ES = os.environ["ES_URL"].strip().rstrip("/")
+    KEY = os.environ["ES_API_KEY"].strip()
+    SPREAD_HOURS = float(os.environ.get("SPREAD_HOURS", "6"))
+    BATCH = int(os.environ.get("BULK_BATCH", "500"))
+    FAMILIES = json.loads(os.environ["FAMILIES_JSON"])
+
+    def req(method, path, body=None, ndjson=False):
+        data = None
+        if body is not None:
+            data = body.encode() if ndjson else json.dumps(body).encode()
+        ct = "application/x-ndjson" if ndjson else "application/json"
+        r = urllib.request.Request(f"{ES}{path}", method=method, data=data,
+            headers={"Authorization": f"ApiKey {KEY}", "Content-Type": ct})
+        with urllib.request.urlopen(r, timeout=180) as resp:
+            return json.loads(resp.read())
+
+    def ds_name(src, fallback_index):
+        d = src.get("data_stream") or {}
+        t, ds, ns = d.get("type"), d.get("dataset"), d.get("namespace")
+        if t and ds and ns:
+            return f"{t}-{ds}-{ns}"
+        idx = fallback_index[4:] if fallback_index.startswith(".ds-") else fallback_index
+        parts = idx.rsplit("-", 2)              # strip -YYYY.MM.DD-000001
+        return parts[0] if len(parts) == 3 else idx
+
+    now = datetime.now(timezone.utc)
+    seed = int(now.timestamp())
+    ingested = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    summary = []
+
+    for fam in FAMILIES:
+        pat = fam["pattern"]; n = int(fam.get("sample", 300)); label = fam.get("label", pat)
+        spread_min = int(float(fam.get("spread_hours", SPREAD_HOURS)) * 60)
+        try:
+            hits = req("POST", f"/{pat}/_search", {
+                "size": n,
+                "query": {"function_score": {"query": {"match_all": {}},
+                    "random_score": {"seed": seed, "field": "_seq_no"}}},
+            })["hits"]["hits"]
+        except Exception as e:
+            summary.append(f"{label}: SEARCH-ERR {str(e)[:80]}"); continue
+        if not hits:
+            summary.append(f"{label}: 0 (empty)"); continue
+        lines = []
+        for h in hits:
+            src = h["_source"]
+            t = now - timedelta(minutes=random.randint(0, spread_min))
+            src["@timestamp"] = t.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            ev = src.get("event")
+            if isinstance(ev, dict):
+                ev["ingested"] = ingested
+            target = ds_name(src, h["_index"])
+            lines.append(json.dumps({"create": {"_index": target}}))
+            lines.append(json.dumps(src))
+        ok = errs = 0; reason = ""
+        for i in range(0, len(lines), BATCH * 2):
+            res = req("POST", "/_bulk?refresh=false", "\n".join(lines[i:i+BATCH*2]) + "\n", ndjson=True)
+            for it in res["items"]:
+                st = it.get("create", {}).get("status")
+                if st in (200, 201): ok += 1
+                else:
+                    errs += 1
+                    if not reason:
+                        reason = str(it.get("create", {}).get("error", {}).get("reason", ""))[:120]
+        summary.append(f"{label}: {ok} ok" + (f", {errs} err ({reason})" if errs else ""))
+
+    print("freshness-recycle @ " + now.isoformat() + " | " + " | ".join(summary))
+  retention.py: |
+    import json, os, urllib.request
+    from datetime import datetime, timedelta, timezone
+
+    ES = os.environ["ES_URL"].strip().rstrip("/")
+    KEY = os.environ["ES_API_KEY"].strip()
+    DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
+    FAMILIES = json.loads(os.environ["FAMILIES_JSON"])
+
+    def req(method, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(f"{ES}{path}", method=method, data=data,
+            headers={"Authorization": f"ApiKey {KEY}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=600) as resp:
+            return json.loads(resp.read())
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=DAYS)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    summ = []
+    for fam in FAMILIES:
+        pat = fam["pattern"]; label = fam.get("label", pat)
+        try:
+            r = req("POST", f"/{pat}/_delete_by_query?conflicts=proceed&wait_for_completion=true",
+                    {"query": {"range": {"@timestamp": {"lt": cutoff}}}})
+            summ.append(f"{label}: -{r.get('deleted', 0)}")
+        except Exception as e:
+            summ.append(f"{label}: ERR {str(e)[:80]}")
+    print(f"retention <{cutoff}: " + " | ".join(summ))
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: data-recycler
+  namespace: security-fc
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: recycler
+            image: python:3.12-slim
+            command: ["python", "/scripts/recycle-data.py"]
+            envFrom:
+            - secretRef:
+                name: security-fc-es-creds
+            env:
+            - name: SPREAD_HOURS
+              value: "6"
+            - name: FAMILIES_JSON
+              value: |
+                [
+                  {"label":"windows_sec","pattern":"logs-system.security-*","sample":400},
+                  {"label":"auditd","pattern":"logs-auditd_manager.auditd-*","sample":400},
+                  {"label":"aws_cloudtrail","pattern":"logs-aws.cloudtrail-*","sample":200},
+                  {"label":"okta","pattern":"logs-okta.system-*","sample":200},
+                  {"label":"network_flow","pattern":"logs-network_traffic.flow-*","sample":800},
+                  {"label":"cspm_findings","pattern":"logs-cloud_security_posture.findings-*","sample":300},
+                  {"label":"qualys","pattern":"logs-qualys_vmdr.*","sample":150},
+                  {"label":"tenable","pattern":"logs-tenable_io.*","sample":150},
+                  {"label":"wiz","pattern":"logs-wiz.*","sample":200}
+                ]
+            volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            resources:
+              requests: {cpu: "20m", memory: "96Mi"}
+              limits: {cpu: "500m", memory: "256Mi"}
+          volumes:
+          - name: scripts
+            configMap:
+              name: freshness-engine-scripts
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: data-retention
+  namespace: security-fc
+spec:
+  schedule: "30 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 900
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: retention
+            image: python:3.12-slim
+            command: ["python", "/scripts/retention.py"]
+            envFrom:
+            - secretRef:
+                name: security-fc-es-creds
+            env:
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: FAMILIES_JSON
+              value: |
+                [
+                  {"label":"windows_sec","pattern":"logs-system.security-*"},
+                  {"label":"auditd","pattern":"logs-auditd_manager.auditd-*"},
+                  {"label":"aws_cloudtrail","pattern":"logs-aws.cloudtrail-*"},
+                  {"label":"okta","pattern":"logs-okta.system-*"},
+                  {"label":"network_flow","pattern":"logs-network_traffic.flow-*"},
+                  {"label":"cspm_findings","pattern":"logs-cloud_security_posture.findings-*"},
+                  {"label":"qualys","pattern":"logs-qualys_vmdr.*"},
+                  {"label":"tenable","pattern":"logs-tenable_io.*"},
+                  {"label":"wiz","pattern":"logs-wiz.*"}
+                ]
+            volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            resources:
+              requests: {cpu: "20m", memory: "96Mi"}
+              limits: {cpu: "500m", memory: "256Mi"}
+          volumes:
+          - name: scripts
+            configMap:
+              name: freshness-engine-scripts

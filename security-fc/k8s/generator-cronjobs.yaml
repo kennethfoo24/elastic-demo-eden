@@ -7,6 +7,11 @@ metadata:
   name: generate-alerts
   namespace: security-fc
 spec:
+  # Suspended: this job creates *synthetic* alerts that don't correlate and don't
+  # feed Attack Discovery. Real, correlatable alerts now come from the live
+  # Elastic Defend attack-range endpoints + the alert-recycler campaigns instead.
+  # Re-enable with: kubectl patch cronjob generate-alerts -n security-fc -p '{"spec":{"suspend":false}}'
+  suspend: true
   schedule: "*/30 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 2
