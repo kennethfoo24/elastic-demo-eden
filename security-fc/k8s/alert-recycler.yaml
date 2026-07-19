@@ -1,0 +1,110 @@
+# Re-emits a random sample of the curated eden-alerts-security corpus as fresh
+# alerts every 6h, timestamps spread over the last few hours. These are the
+# meaningful FC-demo detections (Threat Intel matches, Unusual Windows Process,
+# Malicious Behavior) that feed Attack Discovery — unlike the generator noise.
+# Requires secret security-fc-es-creds (ES_URL, ES_API_KEY) in namespace security-fc.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alert-recycler-script
+  namespace: security-fc
+data:
+  recycle.py: |
+    import json, os, random, urllib.request
+    from datetime import datetime, timedelta, timezone
+
+    ES = os.environ["ES_URL"].strip().rstrip("/")
+    KEY = os.environ["ES_API_KEY"].strip()
+    N = int(os.environ.get("RECYCLE_COUNT", "30"))
+    SPREAD_MIN = int(os.environ.get("SPREAD_MINUTES", "360"))
+    SRC = "eden-alerts-security"
+    DEST = ".alerts-security.alerts-default"
+
+    def req(method, path, body=None):
+        r = urllib.request.Request(f"{ES}{path}", method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"Authorization": f"ApiKey {KEY}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=60) as resp:
+            return json.loads(resp.read())
+
+    seed = int(datetime.now(timezone.utc).timestamp())
+    sample = req("POST", f"/{SRC}/_search", {
+        "size": N,
+        "query": {"function_score": {"query": {"match_all": {}},
+                  "random_score": {"seed": seed, "field": "_seq_no"}}},
+    })["hits"]["hits"]
+
+    now = datetime.now(timezone.utc)
+    lines = []
+    for h in sample:
+        src = h["_source"]
+        t = now - timedelta(minutes=random.randint(1, SPREAD_MIN))
+        iso = t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        for f in ("kibana.alert.last_detected", "kibana.alert.original_time",
+                  "kibana.alert.start", "@timestamp"):
+            if f in src:
+                src[f] = iso
+        src["kibana.alert.workflow_status"] = "open"
+        tags = src.get("kibana.alert.workflow_tags") or []
+        if "XDR" not in tags:
+            tags.append("XDR")
+        src["kibana.alert.workflow_tags"] = tags
+        # new UUID so each emission is a distinct alert
+        import uuid as _uuid
+        new_id = _uuid.uuid4().hex
+        if "kibana.alert.uuid" in src:
+            src["kibana.alert.uuid"] = new_id
+        lines.append(json.dumps({"create": {"_index": DEST, "_id": new_id}}))
+        lines.append(json.dumps(src))
+
+    body = ("\n".join(lines) + "\n").encode()
+    r = urllib.request.Request(f"{ES}/_bulk?refresh=true", method="POST", data=body,
+        headers={"Authorization": f"ApiKey {KEY}", "Content-Type": "application/x-ndjson"})
+    with urllib.request.urlopen(r, timeout=120) as resp:
+        result = json.loads(resp.read())
+    ok = sum(1 for i in result["items"] if i["create"].get("status") in (200, 201))
+    print(f"recycled {ok}/{len(sample)} curated alerts (errors={result['errors']})")
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: alert-recycler
+  namespace: security-fc
+spec:
+  schedule: "10 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: recycler
+            image: python:3.12-slim
+            command: ["python", "/scripts/recycle.py"]
+            envFrom:
+            - secretRef:
+                name: security-fc-es-creds
+            env:
+            - name: RECYCLE_COUNT
+              value: "30"
+            - name: SPREAD_MINUTES
+              value: "360"
+            volumeMounts:
+            - name: script
+              mountPath: /scripts
+            resources:
+              requests:
+                cpu: "10m"
+                memory: "64Mi"
+              limits:
+                cpu: "200m"
+                memory: "128Mi"
+          volumes:
+          - name: script
+            configMap:
+              name: alert-recycler-script
