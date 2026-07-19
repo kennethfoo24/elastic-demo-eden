@@ -2,6 +2,12 @@
 # (elastic-defend-endpoint). Installs Elastic Agent, enrolls to serverless Fleet
 # with Elastic Defend (detect mode). Fleet URL + token come from instance metadata.
 $ErrorActionPreference = "Stop"
+# Progress bar makes Invoke-WebRequest 10-50x slower on a ~600MB download; disable it.
+$ProgressPreference = "SilentlyContinue"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Skip if the agent is already installed (idempotent across reboots)
+if (Test-Path "C:\Program Files\Elastic\Agent\elastic-agent.exe") { exit 0 }
 
 function Meta($k) {
   Invoke-RestMethod -Headers @{'Metadata-Flavor'='Google'} `
@@ -13,8 +19,8 @@ $Enroll   = Meta "enroll_token"
 $Ver      = Meta "agent_version"
 if (-not $Ver) { $Ver = "9.4.0" }
 
-# Demo hostname so alerts read as the EDEN endpoint
-try { Rename-Computer -NewName "elastic-defend-endpoint" -Force } catch {}
+# Demo hostname so alerts read as the attack-range endpoint
+try { Rename-Computer -NewName "kenneth-defend-windows" -Force } catch {}
 
 $dir = "C:\elastic"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null

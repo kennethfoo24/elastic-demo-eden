@@ -10,8 +10,8 @@ ENROLL="$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/c
 AGENT_VER="$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent_version)"
 : "${AGENT_VER:=9.4.0}"
 
-# Demo hostname so alerts read as the EDEN endpoint
-hostnamectl set-hostname xdr-ubuntu-instance || true
+# Demo hostname so alerts read as the attack-range endpoint
+hostnamectl set-hostname kenneth-defend-ubuntu || true
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
